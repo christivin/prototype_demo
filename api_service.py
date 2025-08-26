@@ -16,6 +16,7 @@ Version: 1.0.0
 """
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
 from pathlib import Path
@@ -28,6 +29,9 @@ from typing import Optional, List, Dict, Any
 # DotsOCR核心模块导入
 from dots_ocr.parser import DotsOCRParser
 from dots_ocr.utils.consts import MIN_PIXELS, MAX_PIXELS
+from server.storage import FileStorage
+from server.tasks import TaskManager, TaskStatus
+from server.config import ensure_directories
 
 # ==================== FastAPI应用初始化 ====================
 
@@ -41,6 +45,9 @@ app = FastAPI(
 
 # ==================== 全局配置 ====================
 
+# 初始化通用目录
+ensure_directories()
+
 # DotsOCR解析器实例 - 配置默认参数
 dots_parser = DotsOCRParser(
     ip="localhost",          # VLLM服务器IP地址
@@ -49,6 +56,10 @@ dots_parser = DotsOCRParser(
     min_pixels=MIN_PIXELS,  # 最小像素限制
     max_pixels=MAX_PIXELS   # 最大像素限制
 )
+
+# 文件存储与任务管理实例
+file_storage = FileStorage()
+task_manager = TaskManager()
 
 # ==================== 数据模型定义 ====================
 
@@ -62,6 +73,30 @@ class ParseResult(BaseModel):
     success: bool                              # 解析是否成功
     total_pages: int                          # 总页数
     results: List[Dict[str, Any]]             # 解析结果列表
+
+class UploadResponse(BaseModel):
+    """上传文件响应模型"""
+    id: str
+    filename: str
+    size: int
+
+class FileMeta(BaseModel):
+    """文件元信息模型"""
+    id: str
+    filename: str
+    stored_path: str
+    size: int
+
+class TaskCreateResponse(BaseModel):
+    """任务创建响应模型"""
+    task_id: str
+
+class TaskInfo(BaseModel):
+    """任务信息"""
+    id: str
+    status: str
+    progress: int
+    error: Optional[str] = None
 
 # ==================== 工具函数 ====================
 
@@ -189,6 +224,151 @@ def load_layout_info(layout_info_path: str) -> Dict[str, Any]:
         return {}
 
 # ==================== API端点定义 ====================
+
+# -------- 文件管理：上传/列表/下载 --------
+
+@app.post("/files/upload", response_model=UploadResponse, summary="上传并保存源文件")
+async def upload_file(file: UploadFile = File(..., description="要上传的文件 (PDF, JPG, JPEG, PNG)")):
+    """
+    上传源文件并保存至磁盘，返回文件 ID。
+    """
+    # 验证扩展名
+    _ = validate_file_upload(file, ['.pdf', '.jpg', '.jpeg', '.png'])
+    # 读取内容
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="上传的文件为空")
+    # 存储并返回 ID
+    meta = file_storage.save_upload(file.filename or "upload", content)
+    return UploadResponse(id=meta["id"], filename=meta["filename"], size=meta["size"])  # type: ignore[index]
+
+
+@app.get("/files", response_model=List[FileMeta], summary="查看所有已上传文件")
+async def list_files():
+    """返回文件元信息列表。"""
+    items = file_storage.list_files()
+    return [FileMeta(id=i["id"], filename=i["filename"], stored_path=i["stored_path"], size=i["size"]) for i in items]  # type: ignore[index]
+
+
+@app.get("/files/{file_id}", summary="按ID下载源文件")
+async def download_file(file_id: str):
+    """根据文件 ID 下载源文件。"""
+    path = file_storage.get_file_path(file_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(path=str(path), filename=Path(path).name)
+
+
+# -------- 任务管理：创建/状态/列表/下载结果 --------
+
+@app.post("/tasks/parse/{file_id}", response_model=TaskCreateResponse, summary="创建解析任务(异步)")
+async def create_parse_task(
+    file_id: str,
+    prompt_mode: str = "prompt_layout_all_en",
+    fitz_preprocess: bool = False,
+    mock: bool = False,
+):
+    """根据文件ID创建解析任务，后台异步执行。"""
+    source_path = file_storage.get_file_path(file_id)
+    if not source_path:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    def _job(task_output_dir: str):
+        # 任务执行函数：调用 DotsOCRParser 进行解析，并将成果文件写入 task_output_dir
+        try:
+            # 依据 mock 参数决定是否真实调用模型
+            ext = Path(source_path).suffix.lower()
+            filename = Path(source_path).stem
+            results = []
+            if mock:
+                # 写入模拟结果文件，避免实际模型调用
+                os.makedirs(task_output_dir, exist_ok=True)
+                layout_json_path = Path(task_output_dir) / f"{filename}.json"
+                layout_img_path = Path(task_output_dir) / f"{filename}.jpg"
+                md_path = Path(task_output_dir) / f"{filename}.md"
+                # 伪造一个最小可用布局
+                fake_cells = [{
+                    "bbox": [10, 10, 200, 60],
+                    "category": "Title",
+                    "text": "Mock Title"
+                }, {
+                    "bbox": [10, 80, 300, 140],
+                    "category": "Text",
+                    "text": "This is a mock paragraph for testing."
+                }]
+                with open(layout_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(fake_cells, f, ensure_ascii=False)
+                with open(md_path, 'w', encoding='utf-8') as f:
+                    f.write("# Mock Result\n\nThis is a mock markdown output.")
+                # 占位图像
+                with open(layout_img_path, 'wb') as f:
+                    f.write(b"mock")
+                # 写 jsonl 汇总
+                with open(Path(task_output_dir) / f"{filename}.jsonl", 'w', encoding='utf-8') as w:
+                    w.write(json.dumps({
+                        "page_no": 0,
+                        "layout_info_path": str(layout_json_path),
+                        "layout_image_path": str(layout_img_path),
+                        "md_content_path": str(md_path),
+                        "file_path": str(source_path),
+                    }, ensure_ascii=False) + "\n")
+            else:
+                # 将解析输出定向到任务目录
+                if ext == '.pdf':
+                    results = dots_parser.parse_pdf(
+                        input_path=str(source_path),
+                        filename=filename,
+                        prompt_mode=prompt_mode,
+                        save_dir=task_output_dir,
+                    )
+                else:
+                    results = dots_parser.parse_image(
+                        input_path=str(source_path),
+                        filename=filename,
+                        prompt_mode=prompt_mode,
+                        save_dir=task_output_dir,
+                        fitz_preprocess=fitz_preprocess,
+                    )
+            # 汇总 artifacts：返回主要文件路径，方便客户端下载
+            artifacts = {
+                "result_jsonl": str(Path(task_output_dir) / f"{filename}.jsonl"),
+                "dir": task_output_dir,
+            }
+            return {"ok": True, "artifacts": artifacts}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    task = task_manager.create_task(_job)
+    return TaskCreateResponse(task_id=task["id"])  # type: ignore[index]
+
+
+@app.get("/tasks/{task_id}", response_model=TaskInfo, summary="查看任务状态")
+async def get_task(task_id: str):
+    task = task_manager.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return TaskInfo(id=task["id"], status=task["status"], progress=task.get("progress", 0), error=task.get("error"))  # type: ignore[index]
+
+
+@app.get("/tasks", response_model=List[TaskInfo], summary="查看所有任务")
+async def list_tasks():
+    tasks = task_manager.list()
+    return [TaskInfo(id=t["id"], status=t["status"], progress=t.get("progress", 0), error=t.get("error")) for t in tasks]  # type: ignore[index]
+
+
+@app.get("/tasks/{task_id}/download", summary="下载任务结果目录(压缩包)")
+async def download_task_result(task_id: str):
+    task = task_manager.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    task_dir = Path(task["dir"])  # type: ignore[index]
+    if not task_dir.exists():
+        raise HTTPException(status_code=404, detail="任务输出目录不存在")
+    # 将任务目录打包为 zip
+    zip_path = task_dir.with_suffix("")
+    archive_file = str(zip_path)  # shutil.make_archive 会自动加后缀
+    archive = shutil.make_archive(base_name=archive_file, format="zip", root_dir=str(task_dir))
+    return FileResponse(path=archive, filename=f"{task_id}.zip")
 
 @app.post("/parse/image", response_model=ParseResult, summary="解析图像文件")
 async def parse_image(
