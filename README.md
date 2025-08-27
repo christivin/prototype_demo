@@ -1,4 +1,4 @@
-## 合同/文档 OCR 解析 Web 服务
+##  Web 服务
 
 本项目提供“上传文档 → 异步解析 → 状态查询 → 结果下载”的一站式 Web 服务，基于 FastAPI 实现。解析引擎默认使用 `dots_ocr.parser.DotsOCRParser`，并支持 mock 联调模式（无需实际调用模型即可跑通全流程）。
 
